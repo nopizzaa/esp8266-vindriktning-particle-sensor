@@ -9,8 +9,10 @@
 #include <ESPAsyncWebServer.h>
 #include <ESPAsyncWiFiManager.h>
 #include <Wire.h>
-#include <Adafruit_BMP085.h>
-#include <SensirionI2CScd4x.h>
+
+#include <Adafruit_AHTX0.h>
+#include <Adafruit_BMP280.h>
+#include "Adafruit_SGP30.h"
 
 #include "Config.h"
 #include "SerialCom.h"
@@ -20,10 +22,9 @@
 #define MQTT_CONNECTION_INTERVAL 60000l
 #define MQTT_STATUS_PUBLISH_INTERVAL 30000l
 
-Adafruit_BMP085 bmp;
-
-particleSensorState_t state;
-SensirionI2CScd4x scd4x;
+Adafruit_AHTX0 aht;
+Adafruit_BMP280 bmp;
+Adafruit_SGP30 sgp;
 
 WiFiClient wifiClient;
 PubSubClient mqttClient;
@@ -46,44 +47,59 @@ char MQTT_TOPIC_COMMAND[128];
 char MQTT_TOPIC_AUTOCONF_WIFI_SENSOR[128];
 char MQTT_TOPIC_AUTOCONF_PM25_SENSOR[128];
 char MQTT_TOPIC_AUTOCONF_AVG_TEMPERATURE_SENSOR[128];
-char MQTT_TOPIC_AUTOCONF_SCD4X_CO2_SENSOR[128];
-char MQTT_TOPIC_AUTOCONF_SCD4X_HUMIDITY_SENSOR[128];
+char MQTT_TOPIC_AUTOCONF_AHT_HUMIDITY_SENSOR[128];
+char MQTT_TOPIC_AUTOCONF_SGP30_ECO2_SENSOR[128];
+char MQTT_TOPIC_AUTOCONF_SGP30_TVOC_SENSOR[128];
 char MQTT_TOPIC_AUTOCONF_BMP_TEMPERATURE_SENSOR[128];
 char MQTT_TOPIC_AUTOCONF_BMP_SEA_PRESURE_SENSOR[128];
+char MQTT_TOPIC_AUTOCONF_BMP_PRESURE_SENSOR[128];
+char MQTT_TOPIC_AUTOCONF_BMP_ALTITUDE_SENSOR[128];
+char char MQTT_TOPIC_AUTOCONF_BMP_BOILING_POINT_SENSOR[128];
 
 bool shouldSaveConfig = false;
 
-uint16_t scd4xCo2 = 0;
-float scd4xTemperature = 0.0f;
-float scd4xHumidity = 0.0f;
-uint16_t scd4xError = 0;
-char scd4xErrorMessage[256];
+typedef struct Aht10SensorData
+{
+    float temperature;
+    float humidity;
+};
 
-float bmpTemperature = 0.0f;
-int32_t bmpSealevelPressure = 0;
-int32_t bmpPressure = 0;
-float bmpAltitude = 0.0f;
+typedef struct Bmp280SensorData
+{
+    float temperature;
+    float altitude;
+    float pressure;
+    float seaLevelPressure;
+    float waterBoilingPoint
+};
+
+typedef struct Sgp30SensorData
+{
+    uint16_t tvoc;
+    uint16_t eCo2;
+};
+
+Aht10SensorData     ahtSensorData;
+Bmp280SensorData    bmpSensorData;
+Sgp30SensorData     sgpSensorData;
 
 void saveConfigCallback()
 {
     shouldSaveConfig = true;
 }
 
-void printUint16Hex(uint16_t value)
+uint32_t getAbsoluteHumidity(float temperature, float humidity)
 {
-    Serial.print(value < 4096 ? "0" : "");
-    Serial.print(value < 256 ? "0" : "");
-    Serial.print(value < 16 ? "0" : "");
-    Serial.print(value, HEX);
+    // approximation formula from Sensirion SGP30 Driver Integration chapter 3.15
+    const float absoluteHumidity = 216.7f * ((humidity / 100.0f) * 6.112f * exp((17.62f * temperature) / (243.12f + temperature)) / (273.15f + temperature)); // [g/m^3]
+    const uint32_t absoluteHumidityScaled = static_cast<uint32_t>(1000.0f * absoluteHumidity); // [mg/m^3]
+    return absoluteHumidityScaled;
 }
 
-void printSerialNumber(uint16_t serial0, uint16_t serial1, uint16_t serial2)
+void handleErrorOnSetup(String message)
 {
-    Serial.print("Serial: 0x");
-    printUint16Hex(serial0);
-    printUint16Hex(serial1);
-    printUint16Hex(serial2);
-    Serial.println();
+    Serial.println(message);
+    while (1) {}
 }
 
 void setup()
@@ -93,16 +109,9 @@ void setup()
     Wire.begin();
 
     if (!bmp.begin())
-    {
-        Serial.println("BMP180 Not Found. CHECK CIRCUIT!");
-        while (1) {}
-    }
+        handleErrorOnSetup("Could not find a valid BMP280 sensor, check wiring!");
 
-    readBmp();
-    delay(100);
-
-    if (!setupScd4x())
-        while (1) {}
+    
 
     Serial.println("\n");
     Serial.println("Hello from esp8266-vindriktning-particle-sensor");
