@@ -5,16 +5,28 @@
 #include "Types.h"
 
 namespace SerialCom {
-    constexpr static const uint8_t PIN_UART_RX = 4; // D2 on Wemos D1 Mini
-    constexpr static const uint8_t PIN_UART_TX = 13; // UNUSED
+    constexpr static const uint8_t PIN_UART_RX = 14; // receive sensor response
+    constexpr static const uint8_t PIN_UART_TX = 12; // send request
 
     SoftwareSerial sensorSerial(PIN_UART_RX, PIN_UART_TX);
+
+    const byte init_request[] = {0x11, 0x03, 0x0c, 0x02, 0x1e, 0xc0};
+    const byte request[] = {0x11, 0x02, 0x0b, 0x01, 0xe1};
 
     uint8_t serialRxBuf[255];
     uint8_t rxBufIdx = 0;
 
     void setup() {
         sensorSerial.begin(9600);
+    }
+
+    void init() {
+        sensorSerial.write(init_request, sizeof(init_request));
+    }
+
+    void sendRequest() {
+        Serial.println("Request sent...");
+        sensorSerial.write(request, sizeof(request));
     }
 
     void clearRxBuf() {
