@@ -12,7 +12,7 @@ namespace Config
     char username[24] = "";
     char password[24] = "";
 
-    void save()
+    bool save()
     {
         DynamicJsonDocument json(512);
         json["mqtt_server"] = mqtt_server;
@@ -23,32 +23,34 @@ namespace Config
         if (!configFile)
         {
             Serial.println("Failed to open configurationfile for reading");
-            return;
+            return false;
         }
 
         serializeJson(json, configFile);
         configFile.close();
+
+        return true;
     }
 
-    void load()
+    bool load()
     {
         if (!LittleFS.begin())
         {
             Serial.println("An Error has occurred while mounting LittleFS");
-            return;
+            return false;
         }
 
         if (!LittleFS.exists(CONFIG_FILE_PATH))
         {
             Serial.println("Configuration file does not exist");
-            return;
+            return false;
         }
 
         File configFile = LittleFS.open(CONFIG_FILE_PATH, "r");
         if (!configFile)
         {
             Serial.println("Failed to open configurationfile for reading");
-            return;
+            return false;
         }
 
         const size_t size = configFile.size();
@@ -60,11 +62,13 @@ namespace Config
         if (error)
         {
             Serial.println("JSON deserialization failed");
-            return;
+            return false;
         }
 
         strcpy(mqtt_server, json["mqtt_server"]);
         strcpy(username, json["username"]);
         strcpy(password, json["password"]);
+
+        return true;
     }
 } // namespace Config
