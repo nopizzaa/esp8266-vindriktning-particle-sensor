@@ -11,6 +11,9 @@ namespace Config
     char mqtt_server[80] = "";
     char username[24] = "";
     char password[24] = "";
+    
+    uint16_t sgp30ECo2Base = 0;
+    uint16_t sgp30TvocBase = 0;
 
     bool save()
     {
@@ -19,10 +22,13 @@ namespace Config
         json["username"] = username;
         json["password"] = password;
 
+        json["sgp_eco2_base"] = sgp30ECo2Base;
+        json["sgp_tvoc_base"] = sgp30TvocBase;
+
         File configFile = LittleFS.open(CONFIG_FILE_PATH, "w");
         if (!configFile)
         {
-            Serial.println("Failed to open configurationfile for reading");
+            Serial.println(F("Failed to open configurationfile for reading"));
             return false;
         }
 
@@ -30,26 +36,26 @@ namespace Config
         configFile.close();
 
         return true;
-    }
+    } 
 
     bool load()
     {
         if (!LittleFS.begin())
         {
-            Serial.println("An Error has occurred while mounting LittleFS");
+            Serial.println(F("An Error has occurred while mounting LittleFS"));
             return false;
         }
 
         if (!LittleFS.exists(CONFIG_FILE_PATH))
         {
-            Serial.println("Configuration file does not exist");
+            Serial.println(F("Configuration file does not exist"));
             return false;
         }
 
         File configFile = LittleFS.open(CONFIG_FILE_PATH, "r");
         if (!configFile)
         {
-            Serial.println("Failed to open configurationfile for reading");
+            Serial.println(F("Failed to open configurationfile for reading"));
             return false;
         }
 
@@ -61,13 +67,16 @@ namespace Config
         DeserializationError error = deserializeJson(json, buf.get());
         if (error)
         {
-            Serial.println("JSON deserialization failed");
+            Serial.println(F("JSON deserialization failed"));
             return false;
         }
 
         strcpy(mqtt_server, json["mqtt_server"]);
         strcpy(username, json["username"]);
         strcpy(password, json["password"]);
+
+        sgp30ECo2Base = json["sgp_eco2_base"].as<uint16_t>();
+        sgp30TvocBase = json["sgp_tvoc_base"].as<uint16_t>();
 
         return true;
     }
