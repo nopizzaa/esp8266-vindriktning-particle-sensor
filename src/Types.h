@@ -15,3 +15,19 @@ struct vocSensorState_t {
     uint8_t measurementIdx = 0;
     boolean valid = false;
 };
+
+struct tempHumSensorState_t {
+    float temperature = 0;
+    float humidity = 0;
+    bool isCalibrated = false;
+};
+
+struct pressureSensorState_t {
+    float temperature;
+    float pressure;
+};
+
+struct co2SensorState_t {
+    int co2;
+    int8_t temperature;
+};

@@ -1,10 +1,16 @@
 #define FIRMWARE_PREFIX                         "esp8266-vindriktning-particle-sensor"
+#define FIRMWARE_VERSION                        "2023.02.17"
 #define AVAILABILITY_ONLINE                     "online"
 #define AVAILABILITY_OFFLINE                    "offline"
 
 #define WEBSERVER_PORT                          80
 #define MQTT_PORT                               1883
 #define SGP30_DELAY                             9e5l
+#define I2C_CLOCK                               400000
+
+#define MHZ19_RX_PIN    14                                          // Rx pin which the MHZ19 Tx pin is attached to
+#define MHZ19_TX_PIN    12                                          // Tx pin which the MHZ19 Rx pin is attached to
+#define MHZ19_BAUDRATE  9600                                        // Device to MH-Z19 Serial baudrate (should not be changed)
 
 #define _TASK_PRIORITY
 #define _TASK_WDT_IDS
@@ -15,8 +21,11 @@
 #include <WiFiClient.h>
 #include <PubSubClient.h>
 #include <TaskScheduler.h>
+#include <SparkFun_Qwiic_Humidity_AHT20.h>
+#include <Adafruit_BMP280.h>
 #include "SparkFun_SGP30_Arduino_Library.h"
 #include <Wire.h>
+#include "MHZ19.h"
 
 #include <ESP8266WiFi.h>
 #include <DNSServer.h>
@@ -32,6 +41,9 @@ const char ERROR_SGP30_DELAY[] PROGMEM = "Sensor SGP30 needs least 15 minute to 
 
 particleSensorState_t state;
 vocSensorState_t vocState;
+tempHumSensorState_t tempHummidityState;
+pressureSensorState_t pressureState;
+co2SensorState_t co2SensorState;
 
 WiFiClient wifiClient;
 PubSubClient mqttClient;
@@ -52,22 +64,31 @@ char MQTT_TOPIC_AUTOCONF_WIFI_SENSOR[128];
 char MQTT_TOPIC_AUTOCONF_PM25_SENSOR[128];
 char MQTT_TOPIC_AUTOCONF_ECO2_SENSOR[128];  
 char MQTT_TOPIC_AUTOCONF_VOC_SENSOR[128];
+char MQTT_TOPIC_AUTOCONF_TEMPERATURE_SENSOR[128];
+char MQTT_TOPIC_AUTOCONF_HUMIDITY_SENSOR[128];
+char MQTT_TOPIC_AUTOCONF_PRESURE_SENSOR[128];
+char MQTT_TOPIC_AUTOCONF_CO2_SENSOR[128];  
 
 bool shouldSaveConfig = false;
 
+AHT20 aht;
+Adafruit_BMP280 bmp;
 SGP30 sgp;
+
+MHZ19 mhz19;
+SoftwareSerial mhz19Serial(MHZ19_RX_PIN, MHZ19_TX_PIN);  
 
 Scheduler runner;
 Scheduler highPriority;
 
 void tParticleSensorLoop(void);
 void tVocSensorCallback(void);
-// void tTemperatureSensorCallback(void);
+void tReadSensorCallback(void);
 void tMqttClientLoopCallback(void);
 void tPublishStateCallback(void);
 
 Task tVocSensor(1000, TASK_FOREVER, &tVocSensorCallback, &runner);
-// Task tTemperatureSensor(30000, TASK_FOREVER, &tTemperatureSensorCallback, &runner);
+Task tReadSensorsSensor(20000, TASK_FOREVER, &tReadSensorCallback, &runner);
 Task tPublishState(30000, TASK_FOREVER, &tPublishStateCallback, &runner);
 Task tHandleParticleSensor(1, TASK_FOREVER, &tParticleSensorLoop, &highPriority);
 Task tHandleMqttClient(10, TASK_FOREVER, &tMqttClientLoopCallback, &highPriority);
@@ -91,8 +112,25 @@ void setup() {
     delay(3000);
 
     Wire.begin();
-    Wire.setClock(400000);
+    Wire.setClock(I2C_CLOCK);
 
+    if (! aht.begin()) {
+        Serial.println(F("AHT20 not detected. Please check wiring."));
+    } else {
+        Serial.println(F("AHT20 acknowledged."));
+    }
+
+    if (! bmp.begin()) {
+        Serial.println(F("Could not find a valid BMP280 sensor, check wiring or try a different address!")); 
+    } else {
+        bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,       /* Operating Mode. */
+                        Adafruit_BMP280::SAMPLING_X2,       /* Temp. oversampling */
+                        Adafruit_BMP280::SAMPLING_X16,      /* Pressure oversampling */
+                        Adafruit_BMP280::FILTER_X16,        /* Filtering. */
+                        Adafruit_BMP280::STANDBY_MS_4000);   /* Standby time. */
+        Serial.println(F("BMP280 acknowledged."));
+    }
+    
     if (! sgp.begin()) {
         Serial.println(F("No SGP30 Detected. Check connections."));
     } else {
@@ -102,14 +140,19 @@ void setup() {
         Serial.print((unsigned long)sgp.serialID, HEX);
         Serial.print(F("\tFeature Set Version: 0x"));
         Serial.println(sgp.featureSetVersion, HEX);
+
+        SGP30ERR error;
+        error = sgp.measureTest();
+        if (error == SGP30_SELF_TEST_FAIL) {
+            Serial.println(F("SGP30 Self-Test failed"));
+        }
     }
 
-    SGP30ERR error;
-    error = sgp.measureTest();
-    if (error == SGP30_SELF_TEST_FAIL) {
-        Serial.println(F("SGP30 Self-Test failed"));
-    }
-    
+    mhz19Serial.begin(MHZ19_BAUDRATE);                    // (Uno example) device to MH-Z19 serial start
+    mhz19.begin(mhz19Serial);                             // *Serial(Stream) reference must be passed to library begin().
+    mhz19.autoCalibration();                              // Turn auto calibration ON (OFF autoCalibration(false))
+    mhz19.setFilter();
+
     snprintf(identifier, sizeof(identifier), "VINDRIKTNING-%X", ESP.getChipId());
     snprintf(MQTT_TOPIC_AVAILABILITY, 127, "%s/%s/status", FIRMWARE_PREFIX, identifier);
     snprintf(MQTT_TOPIC_STATE, 127, "%s/%s/state", FIRMWARE_PREFIX, identifier);
@@ -119,6 +162,10 @@ void setup() {
     snprintf(MQTT_TOPIC_AUTOCONF_WIFI_SENSOR, 127, "homeassistant/sensor/%s/%s_wifi/config", FIRMWARE_PREFIX, identifier);
     snprintf(MQTT_TOPIC_AUTOCONF_ECO2_SENSOR, 127, "homeassistant/sensor/%s/%s_eco2/config", FIRMWARE_PREFIX, identifier);
     snprintf(MQTT_TOPIC_AUTOCONF_VOC_SENSOR, 127, "homeassistant/sensor/%s/%s_tvoc/config", FIRMWARE_PREFIX, identifier);
+    snprintf(MQTT_TOPIC_AUTOCONF_TEMPERATURE_SENSOR, 127, "homeassistant/sensor/%s/%s_temp/config", FIRMWARE_PREFIX, identifier);
+    snprintf(MQTT_TOPIC_AUTOCONF_HUMIDITY_SENSOR, 127, "homeassistant/sensor/%s/%s_humidity/config", FIRMWARE_PREFIX, identifier);
+    snprintf(MQTT_TOPIC_AUTOCONF_PRESURE_SENSOR, 127, "homeassistant/sensor/%s/%s_presure/config", FIRMWARE_PREFIX, identifier);
+    snprintf(MQTT_TOPIC_AUTOCONF_CO2_SENSOR, 127, "homeassistant/sensor/%s/%s_co2/config", FIRMWARE_PREFIX, identifier);
 
     DNSServer dns;
     AsyncWiFiManager wifiManager(&webServer,&dns);
@@ -145,9 +192,10 @@ void setup() {
 
     WiFi.hostname(identifier);
     
+    sgp.getBaseline();
     sgp.initAirQuality();
 
-    if (Config::sgp30ECo2Base != 0 && Config::sgp30TvocBase != 0) {
+    if (Config::sgp30ECo2Base > 0 && Config::sgp30TvocBase > 0) {
         sgp.setBaseline(Config::sgp30ECo2Base, Config::sgp30TvocBase);
         Serial.println(F("SGP30 baseline restored"));
     }
@@ -203,13 +251,14 @@ void setup() {
         request->send(response);
     });
 
-    webServer.on("/api/voc-sensor/save-baseline", HTTP_GET, [](AsyncWebServerRequest *request)
-    {
+    webServer.on("/api/voc-sensor/save-baseline", HTTP_GET, [](AsyncWebServerRequest *request) {
         if(millis() <= SGP30_DELAY) {
             Serial.println(ERROR_SGP30_DELAY);
             request->send(500, "text/plain", ERROR_SGP30_DELAY);
             return;
         }
+
+        runner.disableAll(true);
 
         SGP30ERR error;
         error = sgp.getBaseline();
@@ -224,8 +273,10 @@ void setup() {
         Config::sgp30TvocBase = sgp.baselineTVOC;
         Config::save();
 
+        runner.enableAll(true);
+
         AsyncResponseStream *response = request->beginResponseStream("application/json");
-        DynamicJsonDocument json(128);
+        DynamicJsonDocument json(256);
 
         Serial.print(F("\n****Baseline values: eCO2: 0x")); Serial.print(sgp.baselineCO2, HEX);
         Serial.print(F(" & TVOC: 0x")); Serial.println(sgp.baselineTVOC, HEX);
@@ -283,6 +334,59 @@ void setupOTA() {
 void loop() {
     ArduinoOTA.handle();
     runner.execute();
+}
+
+double RHtoAbsolute (float relHumidity, float tempC) {
+    const double eSat = 6.11 * pow(10.0, (7.5 * tempC / (237.7 + tempC)));
+    const double vaporPressure = (relHumidity * eSat) / 100; //millibars
+    const double absHumidity = 1000 * vaporPressure * 100 / ((tempC + 273) * 461.5); //Ideal gas law with unit conversions
+    return absHumidity;
+}
+
+uint16_t doubleToFixedPoint(double number) {
+    const int power = 1 << 8;
+    const double number2 = number * power;
+    const uint16_t value = floor(number2 + 0.5);
+    return value;
+}
+
+void tReadSensorCallback(void) {
+    if (aht.available()) {
+        tempHummidityState.temperature = aht.getTemperature();
+        tempHummidityState.humidity = aht.getHumidity();
+        tempHummidityState.isCalibrated = aht.isCalibrated();
+
+        Serial.printf("New AHT20 values: Temperature: %f C, Humidity: %f RHT\n", 
+            tempHummidityState.temperature, tempHummidityState.humidity);
+
+        const double absHumidity = RHtoAbsolute(tempHummidityState.humidity, tempHummidityState.temperature);
+        //Convert the double type humidity to a fixed point 8.8bit number
+        const uint16_t sensHumidity = doubleToFixedPoint(absHumidity);
+        sgp.setHumidity(sensHumidity);
+    }
+
+    pressureState.temperature = bmp.readTemperature();
+    pressureState.pressure = bmp.readPressure();
+
+    Serial.printf("New BMP280 values: Pressure: %f Pa, Temperature: %fC\n", 
+        pressureState.pressure, pressureState.temperature);
+
+    int co2 = mhz19.getCO2();
+    int8_t temperature = mhz19.getTemperature();
+
+    for (uint8_t i = 0; i < 3; ++i) {
+        if (co2 != 0) {
+            co2SensorState.co2 = co2;
+            co2SensorState.temperature = temperature;
+            Serial.printf("New MHZ-19X values: CO2: %d ppm, Temperature: %dC\n", 
+                co2SensorState.co2, co2SensorState.temperature);
+            break;
+        } else {
+            Serial.println(F("*** MHZ-19X filter was triggered ***"));
+            co2 = mhz19.getCO2();
+            temperature = mhz19.getTemperature();
+        }
+    }
 }
 
 void tVocSensorCallback(void) {
@@ -347,19 +451,38 @@ void tPublishStateCallback(void) {
 void publishState() {
     DynamicJsonDocument vocJson(192);
     DynamicJsonDocument wifiJson(192);
-    DynamicJsonDocument stateJson(604);
-    char payload[256];
+    DynamicJsonDocument humidityJson(192);
+    DynamicJsonDocument pressureJson(192);
+    DynamicJsonDocument co2Json(192);
+
+    DynamicJsonDocument stateJson(1024);
+    char payload[1024];
 
     vocJson["eco2"] = vocState.avgECO2;
     vocJson["tvoc"] = vocState.avgTVOC;
+
+    humidityJson["humidity"] = tempHummidityState.humidity;
+    humidityJson["temp"] = tempHummidityState.temperature;
+    humidityJson["is_calibrated"] = tempHummidityState.isCalibrated;
+
+    pressureJson["temp"] = pressureState.temperature;
+    pressureJson["pressure"] = pressureState.pressure;
 
     wifiJson["ssid"] = WiFi.SSID();
     wifiJson["ip"] = WiFi.localIP().toString();
     wifiJson["rssi"] = WiFi.RSSI();
 
+    co2Json["co2"] = co2SensorState.co2;
+    co2Json["temp"] = co2SensorState.temperature;
+
     stateJson["pm25"] = state.avgPM25;
 
+    stateJson["uptime"] = (uint32_t) millis() / 60000;
+
+    stateJson["humidity_sensor"] = humidityJson.as<JsonObject>();
+    stateJson["pressure_sensor"] = pressureJson.as<JsonObject>();
     stateJson["voc_sensor"] = vocJson.as<JsonObject>();
+    stateJson["co2_sensor"] = co2Json.as<JsonObject>();
     stateJson["wifi"] = wifiJson.as<JsonObject>();
 
     serializeJson(stateJson, payload);
@@ -381,7 +504,7 @@ void publishAutoConfig() {
     device["manufacturer"] = F("IKEA");
     device["model"] = F("VINDRIKTNING");
     device["name"] = identifier;
-    device["sw_version"] = F("2023.02.1");
+    device["sw_version"] = FIRMWARE_VERSION;
 
     autoconfPayload["device"] = device.as<JsonObject>();
     autoconfPayload["availability_topic"] = MQTT_TOPIC_AVAILABILITY;
@@ -438,6 +561,62 @@ void publishAutoConfig() {
 
     serializeJson(autoconfPayload, mqttPayload);
     mqttClient.publish(&MQTT_TOPIC_AUTOCONF_VOC_SENSOR[0], &mqttPayload[0], true);
+
+    autoconfPayload.clear();
+
+    autoconfPayload["device"] = device.as<JsonObject>();
+    autoconfPayload["availability_topic"] = MQTT_TOPIC_AVAILABILITY;
+    autoconfPayload["state_topic"] = MQTT_TOPIC_STATE;
+    autoconfPayload["name"] = identifier + String(" Temperature");
+    autoconfPayload["unit_of_measurement"] = F("˚C");
+    autoconfPayload["value_template"] = F("{{(value_json.humidity_sensor.temp)|round(1)}}");
+    autoconfPayload["unique_id"] = identifier + String("_temp");
+    autoconfPayload["icon"] = F("mdi:thermometer");
+
+    serializeJson(autoconfPayload, mqttPayload);
+    mqttClient.publish(&MQTT_TOPIC_AUTOCONF_TEMPERATURE_SENSOR[0], &mqttPayload[0], true);
+
+    autoconfPayload.clear();
+
+    autoconfPayload["device"] = device.as<JsonObject>();
+    autoconfPayload["availability_topic"] = MQTT_TOPIC_AVAILABILITY;
+    autoconfPayload["state_topic"] = MQTT_TOPIC_STATE;
+    autoconfPayload["name"] = identifier + String(" Humidity");
+    autoconfPayload["unit_of_measurement"] = F("% RH");
+    autoconfPayload["value_template"] = F("{{(value_json.humidity_sensor.humidity)|round(1)}}");
+    autoconfPayload["unique_id"] = identifier + String("_humidity");
+    autoconfPayload["icon"] = F("mdi:water-percent");
+
+    serializeJson(autoconfPayload, mqttPayload);
+    mqttClient.publish(&MQTT_TOPIC_AUTOCONF_HUMIDITY_SENSOR[0], &mqttPayload[0], true);
+
+    autoconfPayload.clear();
+
+    autoconfPayload["device"] = device.as<JsonObject>();
+    autoconfPayload["availability_topic"] = MQTT_TOPIC_AVAILABILITY;
+    autoconfPayload["state_topic"] = MQTT_TOPIC_STATE;
+    autoconfPayload["name"] = identifier + String(" Pressure");
+    autoconfPayload["unit_of_measurement"] = F("hPa");
+    autoconfPayload["value_template"] = F("{{((value_json.pressure_sensor.pressure)|float/100)|round(1)}}");
+    autoconfPayload["unique_id"] = identifier + String("_pressure");
+    autoconfPayload["icon"] = F("mdi:gauge");
+
+    serializeJson(autoconfPayload, mqttPayload);
+    mqttClient.publish(&MQTT_TOPIC_AUTOCONF_PRESURE_SENSOR[0], &mqttPayload[0], true);
+
+    autoconfPayload.clear();
+
+    autoconfPayload["device"] = device.as<JsonObject>();
+    autoconfPayload["availability_topic"] = MQTT_TOPIC_AVAILABILITY;
+    autoconfPayload["state_topic"] = MQTT_TOPIC_STATE;
+    autoconfPayload["name"] = identifier + String(" CO₂");
+    autoconfPayload["unit_of_measurement"] = F("ppm");
+    autoconfPayload["value_template"] = F("{{value_json.co2_sensor.co2}}");
+    autoconfPayload["unique_id"] = identifier + String("_co2_sensor_co2");
+    autoconfPayload["icon"] = F("mdi:molecule-co2");
+
+    serializeJson(autoconfPayload, mqttPayload);
+    mqttClient.publish(&MQTT_TOPIC_AUTOCONF_CO2_SENSOR[0], &mqttPayload[0], true);
 
     autoconfPayload.clear();
 }
