@@ -371,21 +371,19 @@ void tReadSensorCallback(void) {
     Serial.printf("New BMP280 values: Pressure: %f Pa, Temperature: %fC\n", 
         pressureState.pressure, pressureState.temperature);
 
-    int co2 = mhz19.getCO2();
-    int8_t temperature = mhz19.getTemperature();
-
     for (uint8_t i = 0; i < 3; ++i) {
+        int co2 = mhz19.getCO2();
+        int8_t temperature = mhz19.getTemperature();
+
         if (co2 != 0) {
             co2SensorState.co2 = co2;
             co2SensorState.temperature = temperature;
             Serial.printf("New MHZ-19X values: CO2: %d ppm, Temperature: %dC\n", 
                 co2SensorState.co2, co2SensorState.temperature);
             break;
-        } else {
-            Serial.println(F("*** MHZ-19X filter was triggered ***"));
-            co2 = mhz19.getCO2();
-            temperature = mhz19.getTemperature();
         }
+
+        Serial.println(F("*** MHZ-19X filter was triggered ***"));
     }
 }
 
